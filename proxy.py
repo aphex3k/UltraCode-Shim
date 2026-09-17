@@ -123,6 +123,12 @@ LISTEN_HOST = os.environ.get("UC_LISTEN_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("UC_LISTEN_PORT", "8141"))
 UPSTREAM = os.environ.get("UC_UPSTREAM", "https://api.anthropic.com").rstrip("/")
 MAX_TOKENS_FLOOR = int(os.environ.get("UC_MAX_TOKENS", "64000"))
+# Per-route "context_length" clamping: cap max_tokens to the window minus the
+# input. Divide chars by 3 (not 4) to OVER-estimate on code/JSON-heavy
+# transcripts, so we never under-reserve. Absent per-route context_length => no-op.
+CONTEXT_CHARS_PER_TOKEN = 3
+CONTEXT_SAFETY_MARGIN = int(os.environ.get("UC_CONTEXT_MARGIN", "4096"))
+CONTEXT_MIN_MAX_TOKENS = int(os.environ.get("UC_MIN_MAX_TOKENS", "1024"))
 FORCE_EFFORT = os.environ.get("UC_FORCE_EFFORT", "xhigh")
 FORCE_THINKING = os.environ.get("UC_FORCE_THINKING", "1") == "1"
 INJECT_REMINDER = os.environ.get("UC_INJECT_REMINDER", "1") == "1"
@@ -384,6 +390,9 @@ def _routes_to_slots(routes):
             slot["type"] = route["type"]
         if route.get("max_output_tokens"):
             slot["max_output_tokens"] = route["max_output_tokens"]
+        cl = route.get("context_length")
+        if isinstance(cl, int) and cl > 0:
+            slot["context_length"] = cl
         if isinstance(route.get("headers"), dict):
             slot["headers"] = {k: _expand_env(v) for k, v in route["headers"].items()}
         if isinstance(route.get("body"), dict):
@@ -1094,6 +1103,72 @@ def _inject_reminder(body: dict) -> None:
         body["system"] = [{"type": "text", "text": str(system)}, block]
 
 
+def _estimate_content_tokens(content):
+    """Rough token estimate for a message/system content value (str OR a list of
+    blocks). Deliberately over-estimates so we clamp the completion more, never
+    less. Image blocks are a flat cost so we never count base64 bytes."""
+    if isinstance(content, str):
+        return (len(content) + 2) // CONTEXT_CHARS_PER_TOKEN
+    if not isinstance(content, list):
+        return 0
+    total = 0
+    for block in content:
+        if isinstance(block, str):
+            total += (len(block) + 2) // CONTEXT_CHARS_PER_TOKEN
+        elif isinstance(block, dict):
+            bt = block.get("type")
+            if bt == "image":
+                total += 1600
+            elif bt == "tool_result":
+                total += 16 + _estimate_content_tokens(block.get("content"))
+            elif bt == "tool_use":
+                inp = block.get("input")
+                s = json.dumps(inp) if isinstance(inp, (dict, list)) else str(inp or "")
+                total += 16 + (len(s) + 2) // CONTEXT_CHARS_PER_TOKEN
+            elif bt == "text":
+                total += (len(str(block.get("text", ""))) + 2) // CONTEXT_CHARS_PER_TOKEN
+            else:
+                total += (len(json.dumps(block)) + 2) // CONTEXT_CHARS_PER_TOKEN
+    return total
+
+
+def estimate_input_tokens(body):
+    """Estimate the input-side token count of an Anthropic /v1/messages body."""
+    if not isinstance(body, dict):
+        return 0
+    total = 0
+    for m in body.get("messages") or []:
+        if isinstance(m, dict):
+            total += _estimate_content_tokens(m.get("content")) + 8   # role + envelope
+    total += _estimate_content_tokens(body.get("system"))
+    tools = body.get("tools")
+    if isinstance(tools, list):
+        total += (len(json.dumps(tools)) + 2) // CONTEXT_CHARS_PER_TOKEN
+    return total
+
+
+def apply_context_clamp(max_tokens, route, body):
+    """Cap max_tokens to (context_length - est_input - margin) when the route has a
+    known context window. Runs AFTER the floor, so the clamp wins over it. No
+    context_length on the route -> returns max_tokens unchanged."""
+    cl = route.get("context_length")
+    if not isinstance(cl, int) or cl <= 0:
+        return max_tokens
+    est = estimate_input_tokens(body)
+    available = cl - est - CONTEXT_SAFETY_MARGIN
+    target = min(max_tokens, max(available, CONTEXT_MIN_MAX_TOKENS))
+    if target < max_tokens:
+        if available < CONTEXT_MIN_MAX_TOKENS:
+            log("context window nearly full: est_input=%d margin=%d context=%d; "
+                "keeping max_tokens=%d (upstream may still reject)"
+                % (est, CONTEXT_SAFETY_MARGIN, cl, target))
+        else:
+            vlog("context clamp: max_tokens %d -> %d (context=%d est_input=%d margin=%d)"
+                 % (max_tokens, target, cl, est, CONTEXT_SAFETY_MARGIN))
+        return target
+    return max_tokens
+
+
 def transform_messages_body(raw: bytes):
     """Apply the ultracode envelope and resolve the routing slot.
 
@@ -1204,6 +1279,9 @@ def transform_messages_body(raw: bytes):
         mot = slot.get("max_output_tokens")
         if mot:
             route["max_output_tokens"] = mot
+        cl = slot.get("context_length")
+        if isinstance(cl, int) and cl > 0:
+            route["context_length"] = cl
         hdrs = slot.get("headers")
         if isinstance(hdrs, dict):
             route["headers"] = {k: _expand_env(v) for k, v in hdrs.items()}
@@ -1239,6 +1317,12 @@ def transform_messages_body(raw: bytes):
 
     if INJECT_REMINDER and not _system_has_reminder(body.get("system")):
         _inject_reminder(body)
+        changed = True
+
+    _mt0 = body.get("max_tokens")
+    _mt1 = apply_context_clamp(_mt0, route, body)
+    if _mt1 != _mt0:
+        body["max_tokens"] = _mt1
         changed = True
 
     if changed:
@@ -2434,6 +2518,9 @@ class Handler(BaseHTTPRequestHandler):
         # default (8192) unless the slot overrides it with max_output_tokens.
         cap = route.get("max_output_tokens")
         oai_body["max_tokens"] = int(cap) if cap else 8192
+        _mt1 = apply_context_clamp(oai_body["max_tokens"], route, anth)
+        if _mt1 != oai_body["max_tokens"]:
+            oai_body["max_tokens"] = _mt1
         # Optional per-route extra body params merged into the OpenAI request.
         # Lets a backend get provider-specific flags it needs, e.g. MiniMax-M3's
         # "reasoning_split": true (keeps the model's <think> chain-of-thought out

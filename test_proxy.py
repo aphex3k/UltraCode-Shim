@@ -164,6 +164,14 @@ def main():
             "claude-pass": {"model": "claude-opus-4-8", "upstream": mock + "/alt"},
             "claude-passkeep": {"model": "claude-opus-4-8", "upstream": mock + "/alt",
                                 "auth": "passthrough"},
+            # context-window clamping: fixed-window backends set context_length so the
+            # proxy caps max_tokens to fit. 60000 < the 64000 floor (passthrough) and
+            # 12000 < the 8192 openai_compat cap, so both must clamp even on a tiny input.
+            "claude-ctxpass": {"model": "ctxpass-model", "upstream": mock,
+                               "context_length": 60000},
+            "claude-ctxoai": {"type": "openai_compat", "model": "ctxoai-model",
+                              "upstream": mock + "/v1", "auth": "Bearer ${MOCK_KEY}",
+                              "context_length": 12000},
         },
         "router": {
             "enabled": True, "id": "claude-auto", "classifier": "claude-classifier",
@@ -515,6 +523,71 @@ def main():
         assert up._context_length_hint("context length exceeded") != ""
         assert up._context_length_hint("unrelated error") == ""
         print("[ok] openai_compat long-context hygiene: tool-only content=null + context hint")
+
+        # ---- context-window clamping --------------------------------------
+        # When a route sets context_length, max_tokens is capped to
+        # (context_length - est_input - margin) so input+completion fit. The
+        # estimator and clamp are pure, so unit-test them directly first.
+        assert up.estimate_input_tokens({"messages": []}) == 0
+        big = "tok " * 30000                                    # ~120000 chars -> ~40000 est
+        est_str = up.estimate_input_tokens({"messages": [{"role": "user", "content": big}]})
+        assert est_str > 38000, est_str
+        est_list = up.estimate_input_tokens({"messages": [
+            {"role": "user", "content": [{"type": "text", "text": big}]}]})
+        assert abs(est_list - est_str) <= 32, (est_str, est_list)      # str vs block list agree
+        est_img = up.estimate_input_tokens({"messages": [
+            {"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "data": "A" * 300000}}]}]})
+        assert est_img < 1700, est_img                  # flat image cost, NOT the base64 length
+        est_tool = up.estimate_input_tokens({"messages": [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "c1", "name": "Bash",
+                 "input": {"command": "x" * 6000}}]}]})
+        assert est_tool > 2000, est_tool                 # tool_use input JSON is counted
+        # clamp: no context_length -> unchanged; clamp beats the floor; degrade to MIN
+        assert up.apply_context_clamp(64000, {}, {"messages": []}) == 64000
+        assert up.apply_context_clamp(64000, {"context_length": 60000}, {"messages": []}) \
+            == 60000 - up.CONTEXT_SAFETY_MARGIN          # est 0 -> exactly available
+        assert up.apply_context_clamp(64000, {"context_length": 5000}, {"messages": []}) \
+            == up.CONTEXT_MIN_MAX_TOKENS                # available < MIN -> MIN, never <= 0
+        assert up.apply_context_clamp(64000, {"context_length": 50}, {"messages": []}) \
+            == up.CONTEXT_MIN_MAX_TOKENS                # negative available still floors to MIN
+        # end-to-end through the LIVE subprocess proxy (routes added to the e2e config):
+        # a 60000 window must clamp the 64000 floor down (passthrough); a 12000 window
+        # must clamp the openai_compat 8192 cap down. Both hold for any small input.
+        _post("/v1/messages", {"model": "claude-ctxpass", "max_tokens": 100,
+                               "messages": [{"role": "user", "content": "hi"}]})
+        assert SEEN_ANTH["max_tokens"] < 64000, SEEN_ANTH["max_tokens"]
+        assert SEEN_ANTH["max_tokens"] >= up.CONTEXT_MIN_MAX_TOKENS
+        _post("/v1/messages", {"model": "claude-ctxoai", "max_tokens": 100,
+                               "messages": [{"role": "user", "content": "hi"}]})
+        assert SEEN_OAI["max_tokens"] < 8192, SEEN_OAI["max_tokens"]
+        assert SEEN_OAI["max_tokens"] >= up.CONTEXT_MIN_MAX_TOKENS
+        print("[ok] context-window clamp: estimate (str/list/image/tool_use) + clamp "
+              "(no-op/floor-precedence/degrade-to-min) + e2e passthrough & openai_compat")
+
+        # transform_messages_body carries context_length into the route and clamps the
+        # floor for a large input; a route without context_length is left at the floor.
+        up._set_selection(orch=None, worker=None)
+        up._ACTIVE.update({"orch": None, "worker": None, "worker_explicit": False})
+        _slots_ctx, _models_ctx = up.UC_SLOT_MAP, up.UC_MODELS
+        up.UC_SLOT_MAP = {"claude-ctxi": {"model": "ctxi-model", "context_length": 50000},
+                          "claude-noctx": {"model": "noctx-model"}}
+        up.UC_MODELS = [{"id": "claude-ctxi", "display_name": "Ctx I"},
+                        {"id": "claude-noctx", "display_name": "No Ctx"}]
+        out_ctx, route_ctx = up.transform_messages_body(json.dumps({
+            "model": "claude-ctxi", "max_tokens": 100,
+            "messages": [{"role": "user", "content": "word " * 20000}]}).encode())
+        assert route_ctx.get("context_length") == 50000, route_ctx
+        cl = json.loads(out_ctx)["max_tokens"]
+        assert up.CONTEXT_MIN_MAX_TOKENS <= cl < 64000, cl     # big input pushed the floor down
+        out_no, route_no = up.transform_messages_body(json.dumps({
+            "model": "claude-noctx", "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}]}).encode())
+        assert "context_length" not in route_no
+        assert json.loads(out_no)["max_tokens"] >= 64000       # no window -> floor kept
+        up.UC_SLOT_MAP, up.UC_MODELS = _slots_ctx, _models_ctx
+        print("[ok] context-window clamp: transform_messages_body slot->route carry + clamp")
 
         # issue #3: a rejected tool call (with or without a comment) must not leave
         # an assistant tool_calls message unanswered, and tool replies must come
