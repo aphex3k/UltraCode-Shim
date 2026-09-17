@@ -33,7 +33,7 @@
     { "id": "claude-composer",          "display_name": "Composer 2.5 (Cursor, experimental)" }
   ],
 
-  "_routes": "Where each model id above goes. The key MUST match an id in 'models'. Put your API key right here (config.json is gitignored) or use ${ENV_VAR} and set it in your environment. type: omit/'anthropic' = passthrough to Anthropic; 'openai_compat' = any OpenAI Chat Completions backend (with tool-calling); 'codex_oauth' = GPT-5.5 via `codex login`; 'cursor_agent' = Cursor Composer via the cursor-agent CLI (experimental). For openai_compat, 'upstream' is the base URL exactly as the provider documents it (usually ends in /v1) - the proxy appends /chat/completions. Optional: 'headers' {}, 'max_output_tokens' (default 8192).",
+  "_routes": "Where each model id above goes. The key MUST match an id in 'models'. Put your API key right here (config.json is gitignored) or use ${ENV_VAR} and set it in your environment. type: omit/'anthropic' = passthrough to Anthropic; 'openai_compat' = any OpenAI Chat Completions backend (with tool-calling); 'codex_oauth' = GPT-5.5 via `codex login`; 'cursor_agent' = Cursor Composer via the cursor-agent CLI (experimental). For openai_compat, 'upstream' is the base URL exactly as the provider documents it (usually ends in /v1) - the proxy appends /chat/completions. Optional: 'headers' {}, 'max_output_tokens' (default 8192), 'context_length' (optional int = the backend's TOTAL context window in tokens; when set the proxy clamps max_tokens so input+completion always fit, e.g. 262144 for a 256K SGLang/Qwen endpoint; omit if unknown).",
   "routes": {
     "claude-auto": {
       "_": "The Auto Router. type:auto means this is NOT a real backend - the proxy asks the cheap 'classifier' model (configured in the 'router' block below) to score the candidates and routes each task to the cheapest one that clears the quality bar. Pick 'Auto (smart routing)' in /model or the selector.",
@@ -112,11 +112,12 @@
       "auth": "Bearer ${REQUESTY_API_KEY}"
     },
     "claude-local": {
-      "_": "A local OpenAI-compatible server (Ollama :11434, llama.cpp :8080, LM Studio :1234). The key is usually ignored.",
+      "_": "A local OpenAI-compatible server (Ollama :11434, llama.cpp :8080, LM Studio :1234). The key is usually ignored. Set 'context_length' to your server's context window (e.g. 131072) so the proxy clamps max_tokens to fit - self-hosted servers are the fixed-window case that benefits most.",
       "type": "openai_compat",
       "upstream": "http://127.0.0.1:11434/v1",
       "model": "your-local-model",
-      "auth": "Bearer local"
+      "auth": "Bearer local",
+      "context_length": 131072
     },
     "claude-composer": {
       "_": "EXPERIMENTAL. Cursor Composer via the cursor-agent CLI (run `cursor-agent login`). Best for reasoning/answers; tool-calling is a best-effort bridge. See docs/ADD_A_MODEL.md.",
