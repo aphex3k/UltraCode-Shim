@@ -2826,9 +2826,13 @@ class Handler(BaseHTTPRequestHandler):
                     vlog("stream relay ended: %s" % e)
             else:
                 data = resp.read()
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
+                try:
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    self.wfile.flush()
+                except (ConnectionError, BrokenPipeError) as e:
+                    log("client disconnected during relay for %s: %s" % (self.client_address[0], e))
         finally:
             try:
                 resp.close()
