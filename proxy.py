@@ -34,6 +34,17 @@ Claude Code talks to ANTHROPIC_BASE_URL. Point that at this proxy and it:
         - codex_oauth            (GPT-5.5 via a ChatGPT/Codex login; needs the
                                    optional providers/codex_oauth.py)
 
+  4. Answers POST /v1/messages/count_tokens itself so Claude Code's context
+     gauge never 401s against api.anthropic.com. Custom Anthropic-compat
+     upstreams (SGLang, etc.) get the request forwarded; everything else
+     (openai_compat, unmatched, real Claude with no key) gets a local
+     estimate. Upstream 4xx/5xx falls back to the estimate.
+
+  5. Sanitizes Claude Code extras (unknown content-block types, tools
+     missing input_schema, cache_control, mcp_servers) before forwarding
+     to a non-api.anthropic.com Anthropic-compat upstream, so Qwen/SGLang
+     templates don't 500. Opt out per route with body.passthrough_raw.
+
 It is dependency-light: Python 3 standard library only. No pip install.
 
 ENV KNOBS
@@ -68,6 +79,9 @@ ENV KNOBS
                      Chrome UA). Fixes CF 403 "browser_signature_banned" on
                      providers like crof.ai. Override with env or per-route
                      "headers".
+  UC_DUMP_DIR        optional directory; when set, the first UC_DUMP_MAX (default
+                     8) upstream 4xx/5xx /v1/messages payloads are written here
+                     as JSON (no auth headers) so a worker 500 is inspectable.
 
 ROUTE SHAPE (config.json "routes" object)
 -----------------------------------------
@@ -100,7 +114,8 @@ ROUTE SHAPE (config.json "routes" object)
   body     optional dict of extra params merged into the openai_compat request
            body (values support ${VARS}). e.g. MiniMax-M3 needs
            {"reasoning_split": true} so its <think> chain-of-thought is kept out
-           of the visible answer.
+           of the visible answer. For Anthropic-compat custom upstreams,
+           {"passthrough_raw": true} disables the Claude Code extras sanitizer.
 """
 
 import hashlib
@@ -113,6 +128,7 @@ import time
 import uuid
 import urllib.request
 import urllib.error
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # --------------------------------------------------------------------------
@@ -136,6 +152,12 @@ INCLUDE_STOCK_MODELS = os.environ.get("UC_INCLUDE_STOCK_MODELS", "1") != "0"
 LEARN_STOCK_MODELS = os.environ.get("UC_STOCK_LEARN", "1") != "0"
 VERBOSE = os.environ.get("UC_VERBOSE", "0") == "1"
 _LOG_PATH = os.environ.get("UC_LOG", "")
+# Dump the first N failing /v1/messages payloads (body + fingerprint, no auth)
+# when diagnosing worker 500s against a picky Anthropic-compat upstream.
+DUMP_DIR = os.environ.get("UC_DUMP_DIR", "").strip()
+DUMP_MAX = int(os.environ.get("UC_DUMP_MAX", "8"))
+_DUMP_COUNT = 0
+_DUMP_LOCK = threading.Lock()
 
 # --- Security & resource limits (issues #19, #22, #24) ------------------------
 # Loopback Host-header guard: when bound to a loopback address (the default), the
@@ -1169,23 +1191,17 @@ def apply_context_clamp(max_tokens, route, body):
     return max_tokens
 
 
-def transform_messages_body(raw: bytes):
-    """Apply the ultracode envelope and resolve the routing slot.
+def resolve_messages_route(body):
+    """Remap body['model'] onto a routing slot. Mutates body.
 
-    Returns (body_bytes, route). On parse failure returns the original bytes
-    with an empty route so the proxy never breaks a request.
+    Returns (changed, route). ``route`` is empty when the id has no slot (stock
+    Claude / unmatched) so the caller can fall through to the default upstream.
+    Used by both /v1/messages (plus the UltraCode envelope) and
+    /v1/messages/count_tokens (no envelope -- a reminder would inflate the gauge).
     """
-    try:
-        body = json.loads(raw.decode("utf-8"))
-    except Exception as e:
-        vlog("body parse failed, passing through: %s" % e)
-        return raw, {}
-    if not isinstance(body, dict):
-        return raw, {}
-
     changed = False
     model_before = body.get("model")
-    route = {}
+    route = {"inbound_model": model_before}
 
     # 1M context window: Claude Code appends a "[1m]" suffix to a model id to ask
     # the client for the 1M window (it also sends the context-1m beta header). That
@@ -1197,12 +1213,14 @@ def transform_messages_body(raw: bytes):
     if stripped != model_before:
         model_before = stripped
         body["model"] = model_before
+        route["inbound_model"] = model_before
         changed = True
 
     # Orchestrator/Worker: classify tier and remap the model id to the selected
     # orchestrator (heavy) or worker (fast) model. This also captures the dynamic
     # workflow's stock-model background traffic so it follows your pick.
     tier = _request_tier(body)
+    route["tier"] = tier
     routed_id = _select_target(model_before, tier)
     if routed_id != model_before:
         body["model"] = routed_id
@@ -1291,7 +1309,16 @@ def transform_messages_body(raw: bytes):
     elif model_before in UC_MODEL_MAP:
         body["model"] = UC_MODEL_MAP[model_before]
         changed = True
+    return changed, route
 
+
+def apply_ultracode_envelope(body, route):
+    """Mutate body with effort / thinking / max_tokens floor / reminder / clamp.
+
+    Returns True if anything changed. Skipped for count_tokens so the gauge
+    measures Claude Code's request, not the envelope we'd add on the real turn.
+    """
+    changed = False
     if FORCE_EFFORT:
         oc = body.get("output_config")
         if not isinstance(oc, dict):
@@ -1324,12 +1351,306 @@ def transform_messages_body(raw: bytes):
     if _mt1 != _mt0:
         body["max_tokens"] = _mt1
         changed = True
+    return changed
+
+
+# Content-block types SGLang's Anthropic schema (and Qwen chat templates) accept.
+# Anything else (document, mcp_tool_use, server_tool_use, tool_reference, ...) is
+# coerced to text so the template doesn't raise TemplateError -> HTTP 500.
+_KNOWN_BLOCK_TYPES = frozenset({
+    "text", "image", "tool_use", "tool_result",
+    "thinking", "redacted_thinking", "search_result",
+})
+_DROP_ANTHROPIC_EXTRAS = ("mcp_servers", "container")
+
+
+def _is_real_anthropic_upstream(url):
+    """True when url's host is exactly api.anthropic.com.
+
+    Host comparison (not a substring of the whole URL) so
+    https://evil.example/api.anthropic.com is not treated as real Claude.
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return False
+    if "://" not in raw:
+        raw = "https://" + raw
+    host = (urllib.parse.urlparse(raw).hostname or "").lower()
+    return host == "api.anthropic.com"
+
+
+def _should_sanitize_anthropic(route):
+    """True for Anthropic-passthrough to a non-api.anthropic.com upstream.
+
+    Real Claude stays byte-faithful. Opt out with body.passthrough_raw on the route.
+    """
+    if not isinstance(route, dict):
+        return False
+    extra = route.get("body")
+    if isinstance(extra, dict) and extra.get("passthrough_raw"):
+        return False
+    rtype = route.get("type")
+    if rtype in ("openai_compat", "codex_oauth", "cursor_agent", "auto"):
+        return False
+    up = (route.get("upstream") or "").rstrip("/")
+    if not up:
+        return False
+    if up == (UPSTREAM or "").rstrip("/"):
+        return False
+    if _is_real_anthropic_upstream(up):
+        return False
+    return True
+
+
+def _count_tokens_should_forward(route):
+    """Forward count_tokens only to a custom Anthropic-compat upstream (SGLang).
+
+    openai_compat/codex/cursor, unmatched ids, and real api.anthropic.com all
+    get a local estimate -- that's what stops the 401 flood when unmatched
+    requests would otherwise fall through to Anthropic with no key.
+    """
+    if not isinstance(route, dict):
+        return False
+    rtype = route.get("type")
+    if rtype in ("openai_compat", "codex_oauth", "cursor_agent", "auto"):
+        return False
+    up = (route.get("upstream") or "").rstrip("/")
+    if not up:
+        return False
+    if up == (UPSTREAM or "").rstrip("/"):
+        return False
+    if _is_real_anthropic_upstream(up):
+        return False
+    return True
+
+
+def _sanitize_content(content):
+    """Coerce unknown content-block types to text; flatten tool_reference.
+
+    Returns (new_content, changed). Strings and non-lists are left alone.
+    """
+    if not isinstance(content, list):
+        return content, False
+    out = []
+    changed = False
+    for block in content:
+        if not isinstance(block, dict):
+            out.append(block)
+            continue
+        bt = block.get("type")
+        if bt == "tool_reference":
+            name = block.get("name") or block.get("tool_name") or ""
+            out.append({"type": "text", "text": "[tool_reference: %s]" % name})
+            changed = True
+            continue
+        if bt == "tool_result":
+            new_block = block
+            inner, ich = _sanitize_content(block.get("content"))
+            if ich or "cache_control" in block:
+                new_block = dict(block)
+                if ich:
+                    new_block["content"] = inner
+                new_block.pop("cache_control", None)
+                changed = True
+            out.append(new_block)
+            continue
+        if bt not in _KNOWN_BLOCK_TYPES:
+            try:
+                text = json.dumps(block, ensure_ascii=False)
+            except Exception:
+                text = str(block)
+            out.append({"type": "text", "text": text})
+            changed = True
+            continue
+        if "cache_control" in block:
+            new_block = dict(block)
+            new_block.pop("cache_control", None)
+            out.append(new_block)
+            changed = True
+            continue
+        out.append(block)
+    return (out, True) if changed else (content, False)
+
+
+def sanitize_anthropic_compat(body):
+    """In-place: make a Claude Code Anthropic body safe for SGLang/Qwen.
+
+    Unknown content blocks -> text; tools get input_schema if missing;
+    cache_control is stripped (radix cache doesn't need it); mcp_servers /
+    container are dropped. Returns True if anything changed.
+    """
+    if not isinstance(body, dict):
+        return False
+    changed = False
+    for drop in _DROP_ANTHROPIC_EXTRAS:
+        if drop in body:
+            del body[drop]
+            changed = True
+    system = body.get("system")
+    if isinstance(system, list):
+        new, ch = _sanitize_content(system)
+        if ch:
+            body["system"] = new
+            changed = True
+    elif isinstance(system, dict):
+        if "cache_control" in system:
+            system = dict(system)
+            system.pop("cache_control", None)
+            body["system"] = system
+            changed = True
+    messages = body.get("messages")
+    if isinstance(messages, list):
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            if "cache_control" in msg:
+                msg.pop("cache_control", None)
+                changed = True
+            new, ch = _sanitize_content(msg.get("content"))
+            if ch:
+                msg["content"] = new
+                changed = True
+    tools = body.get("tools")
+    if isinstance(tools, list):
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            if "cache_control" in tool:
+                tool.pop("cache_control", None)
+                changed = True
+            if "input_schema" not in tool:
+                tool["input_schema"] = {"type": "object", "properties": {}}
+                changed = True
+    return changed
+
+
+def _content_block_types(content, into=None):
+    """Collect content-block type strings from a message/system content value."""
+    if into is None:
+        into = set()
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict):
+                bt = block.get("type")
+                if bt:
+                    into.add(bt)
+                if bt == "tool_result":
+                    _content_block_types(block.get("content"), into)
+    return into
+
+
+def request_fingerprint(body, route=None):
+    """Compact description of a /v1/messages body for 4xx/5xx log lines."""
+    if not isinstance(body, dict):
+        return {"keys": []}
+    tools = body.get("tools") or []
+    names = [t.get("name") for t in tools if isinstance(t, dict) and t.get("name")]
+    block_types = set()
+    _content_block_types(body.get("system"), block_types)
+    for msg in body.get("messages") or []:
+        if isinstance(msg, dict):
+            _content_block_types(msg.get("content"), block_types)
+    fp = {
+        "inbound": (route or {}).get("inbound_model"),
+        "model": body.get("model"),
+        "tier": (route or {}).get("tier") or _request_tier(body),
+        "tools": names,
+        "n_messages": len(body.get("messages") or []),
+        "est_input": estimate_input_tokens(body),
+        "keys": sorted(str(k) for k in body.keys()),
+        "block_types": sorted(block_types),
+    }
+    return fp
+
+
+def _dump_failing_request(status, url, err_text, body, route):
+    """Write the first DUMP_MAX failing payloads to UC_DUMP_DIR (if set)."""
+    global _DUMP_COUNT
+    if not DUMP_DIR:
+        return
+    with _DUMP_LOCK:
+        if _DUMP_COUNT >= DUMP_MAX:
+            return
+        _DUMP_COUNT += 1
+        n = _DUMP_COUNT
+    try:
+        os.makedirs(DUMP_DIR, exist_ok=True)
+        path = os.path.join(DUMP_DIR, "fail-%03d-%s.json" % (n, status))
+        payload = {
+            "status": status,
+            "url": url,
+            "error": err_text,
+            "fingerprint": request_fingerprint(body, route),
+            "body": body,
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+        log("dumped failing request to %s" % path)
+    except Exception as e:
+        vlog("dump failed: %s" % e)
+
+
+def _parse_body_dict(raw):
+    if not raw:
+        return {}
+    try:
+        obj = json.loads(raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def transform_messages_body(raw: bytes):
+    """Apply the ultracode envelope and resolve the routing slot.
+
+    Returns (body_bytes, route). On parse failure returns the original bytes
+    with an empty route so the proxy never breaks a request.
+    """
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        vlog("body parse failed, passing through: %s" % e)
+        return raw, {}
+    if not isinstance(body, dict):
+        return raw, {}
+
+    inbound = body.get("model")
+    changed, route = resolve_messages_route(body)
+    if apply_ultracode_envelope(body, route):
+        changed = True
+    if _should_sanitize_anthropic(route):
+        if sanitize_anthropic_compat(body):
+            changed = True
+            vlog("sanitized anthropic-compat extras for %s" % route.get("upstream"))
 
     if changed:
         vlog("rewrote model=%s -> %s effort=%s max_tokens=%s"
-             % (model_before, body.get("model"),
+             % (inbound, body.get("model"),
                 body.get("output_config", {}).get("effort"),
                 body.get("max_tokens")))
+        return json.dumps(body).encode("utf-8"), route
+    return raw, route
+
+
+def transform_count_tokens_body(raw: bytes):
+    """Resolve the routing slot for count_tokens WITHOUT the UltraCode envelope.
+
+    A reminder / max_tokens floor / thinking block would inflate the gauge.
+    Custom Anthropic-compat upstreams still get the extras sanitizer so a
+    worker-shaped count_tokens body doesn't 500 on SGLang.
+    """
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        vlog("count_tokens body parse failed: %s" % e)
+        return raw, {}
+    if not isinstance(body, dict):
+        return raw, {}
+    changed, route = resolve_messages_route(body)
+    if _should_sanitize_anthropic(route):
+        if sanitize_anthropic_compat(body):
+            changed = True
+    if changed:
         return json.dumps(body).encode("utf-8"), route
     return raw, route
 
@@ -2009,6 +2330,8 @@ def _classifier_complete(slot, system_prompt, user_content, timeout):
         sbody = slot.get("body")
         if isinstance(sbody, dict):
             for bk, bv in sbody.items():
+                if bk == "passthrough_raw":
+                    continue
                 payload[bk] = _expand_env(bv) if isinstance(bv, str) else bv
         data = json.dumps(payload).encode("utf-8")
         headers = {"Content-Type": "application/json", "Accept": "application/json",
@@ -2426,13 +2749,66 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return self.rfile.read(n)
 
+    def _count_tokens_local(self, body_bytes, why):
+        parsed = _parse_body_dict(body_bytes)
+        n = estimate_input_tokens(parsed)
+        log("count_tokens local est=%d (%s)" % (n, why))
+        self._raw(200, "application/json",
+                  json.dumps({"input_tokens": n}).encode("utf-8"))
+
+    def _log_upstream_http_error(self, status, err_data, body_bytes, route, url):
+        """Always log 4xx/5xx body + fingerprint (not gated on UC_VERBOSE)."""
+        err_text = ""
+        try:
+            err_text = (err_data or b"").decode("utf-8", "replace")
+        except Exception:
+            err_text = repr(err_data)
+        snippet = err_text[:2000].replace("\n", " ").strip()
+        parsed = _parse_body_dict(body_bytes)
+        fp = request_fingerprint(parsed, route)
+        log("upstream HTTP %s for %s body=%s fp=%s"
+            % (status, url, snippet or "(empty)", json.dumps(fp, default=str)))
+        _dump_failing_request(status, url, snippet, parsed, route)
+
+    def _relay_error_body(self, resp, data):
+        """Send an already-read HTTPError body to the client (read() is consumed)."""
+        try:
+            status = getattr(resp, "status", None) or resp.getcode()
+            self.send_response(status)
+            for k, v in resp.headers.items():
+                kl = k.lower()
+                if kl in _HOP_BY_HOP or kl in ("content-length", "content-encoding"):
+                    continue
+                self.send_header(k, v)
+            payload = data or b""
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            if payload:
+                self.wfile.write(payload)
+        except Exception:
+            pass
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
     def _proxy(self, method: str):
         body = self._read_body()
         if body is None:
             return
-        is_messages = self.path.split("?")[0].endswith("/v1/messages")
+        path = self.path.split("?")[0]
+        # count_tokens does NOT end with /v1/messages; keep them distinct so
+        # openai_compat never POSTs a count to /chat/completions.
+        is_count_tokens = path.endswith("/v1/messages/count_tokens")
+        is_messages = path.endswith("/v1/messages")
         route = {}
-        if is_messages and method == "POST" and body:
+        if is_count_tokens and method == "POST":
+            body, route = transform_count_tokens_body(body or b"{}")
+            if not _count_tokens_should_forward(route):
+                self._count_tokens_local(body, why="no custom anthropic upstream")
+                return
+        elif is_messages and method == "POST" and body:
             body, route = transform_messages_body(body)
 
         rtype = route.get("type")
@@ -2477,15 +2853,31 @@ class Handler(BaseHTTPRequestHandler):
                 surface_id = _b.get("model")
             except Exception:
                 pass
+        if is_count_tokens:
+            log("count_tokens forwarded to %s" % upstream)
         req = urllib.request.Request(url, data=body or None,
                                      headers=fwd_headers, method=method)
         try:
             resp = urllib.request.urlopen(req, timeout=600)
         except urllib.error.HTTPError as e:
-            self._relay_response(e, streaming=False)
+            err_data = b""
+            try:
+                err_data = e.read()
+            except Exception:
+                pass
+            self._log_upstream_http_error(
+                getattr(e, "code", "?"), err_data, body, route, url)
+            if is_count_tokens:
+                self._count_tokens_local(
+                    body, why="upstream HTTP %s" % getattr(e, "code", "?"))
+                return
+            self._relay_error_body(e, err_data)
             return
         except Exception as e:
             log("upstream error %s for %s" % (e, url))
+            if is_count_tokens:
+                self._count_tokens_local(body, why="upstream error: %s" % e)
+                return
             msg = "upstream error talking to %s: %s" % (upstream, e)
             if is_messages and method == "POST":
                 self._emit_or_error(want_stream, surface_id or "claude", 502, msg)
@@ -2528,6 +2920,8 @@ class Handler(BaseHTTPRequestHandler):
         extra_body = route.get("body")
         if isinstance(extra_body, dict):
             for bk, bv in extra_body.items():
+                if bk == "passthrough_raw":
+                    continue  # proxy-only flag for Anthropic-compat sanitizer
                 oai_body[bk] = _expand_env(bv) if isinstance(bv, str) else bv
         payload = json.dumps(oai_body).encode("utf-8")
 

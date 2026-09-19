@@ -35,6 +35,18 @@ the *same* envelope on a request and then forward it to **any** backend.
    own entries from `config.json` so they show up in the `/model` picker.
 3. **Routes** each model id Claude Code sends to a real backend, per the
    `routes` map in `config.json`.
+4. **Answers `POST /v1/messages/count_tokens`** so Claude Code's context gauge
+   and proactive compact keep working. Custom Anthropic-compat upstreams
+   (SGLang and similar) get the request forwarded with the rewritten model id
+   (no UltraCode envelope — that would inflate the count). `openai_compat` /
+   `codex_oauth` / `cursor_agent`, unmatched ids, and real `api.anthropic.com`
+   (no key, or a 401) get a local estimate from the same char-based counter the
+   context clamp uses. An upstream 4xx/5xx also falls back to the estimate, so
+   the gauge never 401s.
+5. **Sanitizes Claude Code extras** before forwarding to a *non-Anthropic*
+   Anthropic-compat server (unknown content-block types, tools missing
+   `input_schema`, `cache_control`, `mcp_servers`). Real `api.anthropic.com`
+   stays byte-faithful. Opt out per route with `"body": {"passthrough_raw": true}`.
 
 ## 3. Why your models appear in `/model` (gateway discovery)
 
@@ -92,8 +104,12 @@ When you pick a model, Claude Code sends its id as `model`. The proxy looks that
 id up in `config.json` → `routes` and forwards accordingly:
 
 - **Anthropic passthrough** (no `type`, or `type: "anthropic"`) — forwards the
-  request unchanged to `upstream` (default `api.anthropic.com`, i.e. real
-  Claude) or any Anthropic-compatible endpoint. Tools work natively.
+  request to `upstream` (default `api.anthropic.com`, i.e. real Claude) or any
+  Anthropic-compatible endpoint. Tools work natively. Non-Anthropic Anthropic-compat
+  servers (SGLang, local gateways) also get a sanitizer so Claude Code extras
+  that those schemas reject (unknown content-block types, tools without
+  `input_schema`, rolling `cache_control`) don't 500; disable with
+  `"body": {"passthrough_raw": true}`.
 - **`openai_compat`** — translates the Anthropic request to an OpenAI
   Chat Completions request, POSTs it to `upstream + /chat/completions`, and
   translates the response back. **Tool calls are translated both ways**

@@ -19,6 +19,7 @@ SEEN_OAI = None
 SEEN_OAI_HEADERS = None
 SEEN_ANTH = None
 SEEN_ANTH_HEADERS = None
+SEEN_COUNT = None
 
 
 class Mock(BaseHTTPRequestHandler):
@@ -44,7 +45,7 @@ class Mock(BaseHTTPRequestHandler):
             self._j(404, {"e": "nope"})
 
     def do_POST(self):
-        global SEEN_OAI, SEEN_OAI_HEADERS, SEEN_ANTH, SEEN_ANTH_HEADERS
+        global SEEN_OAI, SEEN_OAI_HEADERS, SEEN_ANTH, SEEN_ANTH_HEADERS, SEEN_COUNT
         n = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(n) if n else b"{}")
         path = self.path.split("?")[0]
@@ -101,9 +102,26 @@ class Mock(BaseHTTPRequestHandler):
                  "usage": {"prompt_tokens": 11, "completion_tokens": 7}})
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
+        elif path.endswith("/v1/messages/count_tokens"):
+            SEEN_COUNT = body
+            if body.get("model") == "count-fail-model":
+                self._j(500, {"type": "error",
+                              "error": {"type": "internal_error", "message": "nope"}})
+                return
+            self._j(200, {"input_tokens": 42})
         elif path.endswith("/v1/messages"):
             SEEN_ANTH = body
             SEEN_ANTH_HEADERS = {k: v for k, v in self.headers.items()}
+            # Custom Anthropic-compat upstream (/alt/...): 500 unless every tool
+            # has input_schema -- simulates SGLang rejecting Claude Code native
+            # tools. The proxy sanitizer must fill that in before we get here.
+            if path.startswith("/alt"):
+                for t in body.get("tools") or []:
+                    if isinstance(t, dict) and "input_schema" not in t:
+                        self._j(500, {"type": "error", "error": {
+                            "type": "internal_error",
+                            "message": "missing input_schema on %s" % t.get("name")}})
+                        return
             self._j(200, {"id": "msg_x", "type": "message", "role": "assistant",
                           "model": body.get("model"),
                           "content": [{"type": "text", "text": "ok"}],
@@ -128,6 +146,7 @@ def _get(path):
 
 
 def main():
+    global SEEN_COUNT, SEEN_OAI, SEEN_ANTH, SEEN_ANTH_HEADERS
     srv = ThreadingHTTPServer(("127.0.0.1", MOCK_PORT), Mock)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     mock = "http://127.0.0.1:%d" % MOCK_PORT
@@ -140,7 +159,10 @@ def main():
                    {"id": "claude-cheap", "display_name": "Cheap"},
                    {"id": "claude-strong", "display_name": "Strong"},
                    {"id": "claude-pass", "display_name": "Passthrough custom upstream"},
-                   {"id": "claude-passkeep", "display_name": "Passthrough creds opt-in"}],
+                   {"id": "claude-passkeep", "display_name": "Passthrough creds opt-in"},
+                   {"id": "claude-countfail", "display_name": "Count-tokens upstream 500"},
+                   {"id": "claude-ctxpass", "display_name": "Ctx passthrough"},
+                   {"id": "claude-ctxoai", "display_name": "Ctx openai"}],
         "routes": {
             "claude-opus-4-8": {"model": "claude-opus-4-8", "upstream": mock, "auth": "passthrough"},
             "claude-mock": {"type": "openai_compat", "model": "mock-model",
@@ -164,6 +186,7 @@ def main():
             "claude-pass": {"model": "claude-opus-4-8", "upstream": mock + "/alt"},
             "claude-passkeep": {"model": "claude-opus-4-8", "upstream": mock + "/alt",
                                 "auth": "passthrough"},
+            "claude-countfail": {"model": "count-fail-model", "upstream": mock + "/alt"},
             # context-window clamping: fixed-window backends set context_length so the
             # proxy caps max_tokens to fit. 60000 < the 64000 floor (passthrough) and
             # 12000 < the 8192 openai_compat cap, so both must clamp even on a tiny input.
@@ -589,6 +612,162 @@ def main():
         up.UC_SLOT_MAP, up.UC_MODELS = _slots_ctx, _models_ctx
         print("[ok] context-window clamp: transform_messages_body slot->route carry + clamp")
 
+        # ---- count_tokens + Anthropic-compat sanitizer --------------------
+        # Unit: sanitizer coerces unknown blocks, fills input_schema, strips
+        # cache_control / mcp_servers; api.anthropic.com is not sanitized.
+        dirty = {
+            "model": "qwen",
+            "system": [{"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}},
+                {"type": "document", "source": {"type": "text", "data": "x"}},
+                {"type": "tool_reference", "name": "Bash"},
+            ], "cache_control": {"type": "ephemeral"}}],
+            "tools": [{"name": "Bash", "description": "run"}],
+            "mcp_servers": [{"name": "x"}],
+            "container": {"id": "c"},
+        }
+        assert up.sanitize_anthropic_compat(dirty) is True
+        assert "mcp_servers" not in dirty and "container" not in dirty
+        assert dirty["tools"][0]["input_schema"] == {"type": "object", "properties": {}}
+        assert "cache_control" not in dirty["system"][0]
+        assert "cache_control" not in dirty["messages"][0]
+        types = [b["type"] for b in dirty["messages"][0]["content"]]
+        assert types == ["text", "text", "text"], types
+        assert dirty["messages"][0]["content"][1]["type"] == "text"  # document coerced
+        assert dirty["messages"][0]["content"][2]["text"].startswith("[tool_reference:")
+        # known tools with a schema are left untouched
+        clean = {"tools": [{"name": "Read", "input_schema": {"type": "object", "properties": {"p": {}}}}],
+                 "messages": [{"role": "user", "content": [{"type": "text", "text": "ok"}]}]}
+        assert up.sanitize_anthropic_compat(clean) is False
+        assert up._should_sanitize_anthropic({}) is False
+        assert up._should_sanitize_anthropic({"upstream": "https://api.anthropic.com"}) is False
+        assert up._should_sanitize_anthropic({"upstream": "https://api.anthropic.com/"}) is False
+        assert up._is_real_anthropic_upstream("https://api.anthropic.com") is True
+        assert up._is_real_anthropic_upstream("https://evil.example/api.anthropic.com") is False
+        assert up._should_sanitize_anthropic(
+            {"upstream": "https://evil.example/api.anthropic.com"}) is True
+        assert up._should_sanitize_anthropic({"upstream": "http://127.0.0.1:8888"}) is True
+        assert up._should_sanitize_anthropic(
+            {"upstream": "http://127.0.0.1:8888", "body": {"passthrough_raw": True}}) is False
+        assert up._should_sanitize_anthropic(
+            {"type": "openai_compat", "upstream": "http://127.0.0.1:8888"}) is False
+        fp = up.request_fingerprint(dirty, {"inbound_model": "claude-worker-x", "tier": "fast"})
+        assert fp["inbound"] == "claude-worker-x" and fp["tier"] == "fast"
+        assert "Bash" in fp["tools"] and fp["n_messages"] == 1
+        # dump writes once under UC_DUMP_DIR
+        import tempfile
+        _dump_d = tempfile.mkdtemp(prefix="uc_dump_")
+        _saved_dump = (up.DUMP_DIR, up.DUMP_MAX, up._DUMP_COUNT)
+        try:
+            up.DUMP_DIR, up.DUMP_MAX, up._DUMP_COUNT = _dump_d, 8, 0
+            up._dump_failing_request(500, "http://x/v1/messages", "boom", dirty, {})
+            dumped = os.listdir(_dump_d)
+            assert dumped == ["fail-001-500.json"], dumped
+            with open(os.path.join(_dump_d, dumped[0]), encoding="utf-8") as f:
+                dumped_obj = json.load(f)
+            assert dumped_obj["status"] == 500 and dumped_obj["body"]["model"] == "qwen"
+        finally:
+            up.DUMP_DIR, up.DUMP_MAX, up._DUMP_COUNT = _saved_dump
+            try:
+                for fn in os.listdir(_dump_d):
+                    os.remove(os.path.join(_dump_d, fn))
+                os.rmdir(_dump_d)
+            except OSError:
+                pass
+        print("[ok] anthropic-compat sanitizer + fingerprint + UC_DUMP_DIR")
+
+        # count_tokens: transform skips the UltraCode envelope (no floor/reminder).
+        up._set_selection(orch=None, worker=None)
+        up._ACTIVE.update({"orch": None, "worker": None, "worker_explicit": False})
+        _slots_ct, _models_ct = up.UC_SLOT_MAP, up.UC_MODELS
+        up.UC_SLOT_MAP = {"claude-pass": {"model": "qwen-real", "upstream": "http://127.0.0.1:8888"}}
+        up.UC_MODELS = [{"id": "claude-pass", "display_name": "Pass"}]
+        ct_raw, ct_route = up.transform_count_tokens_body(json.dumps({
+            "model": "claude-pass",
+            "messages": [{"role": "user", "content": "hello"}]}).encode())
+        ct_body = json.loads(ct_raw)
+        assert ct_body["model"] == "qwen-real", ct_body
+        assert "max_tokens" not in ct_body
+        assert "output_config" not in ct_body
+        assert "thinking" not in ct_body
+        assert up._count_tokens_should_forward(ct_route) is True
+        assert up._count_tokens_should_forward({}) is False
+        assert up._count_tokens_should_forward({"type": "openai_compat",
+                                                "upstream": "http://x/v1"}) is False
+        assert up._count_tokens_should_forward(
+            {"upstream": "https://api.anthropic.com"}) is False
+        assert up._count_tokens_should_forward(
+            {"upstream": "https://evil.example/api.anthropic.com"}) is True
+        up.UC_SLOT_MAP, up.UC_MODELS = _slots_ct, _models_ct
+        print("[ok] count_tokens transform: route remap, no envelope")
+
+        # Live proxy: custom Anthropic-compat count_tokens is forwarded (model
+        # rewritten, no envelope); openai_compat is local; unmatched/default is
+        # local (never 401); upstream 500 still 200 with an estimate.
+        _post("/uc/select", {"orchestrator": "claude-pass", "worker": "claude-pass"})
+        SEEN_COUNT = None
+        ct_fwd = json.loads(_post("/v1/messages/count_tokens?beta=true", {
+            "model": "claude-pass",
+            "messages": [{"role": "user", "content": "hello world"}]}))
+        assert ct_fwd.get("input_tokens") == 42, ct_fwd
+        assert SEEN_COUNT is not None, "count_tokens was not forwarded to custom upstream"
+        assert SEEN_COUNT.get("model") == "claude-opus-4-8", SEEN_COUNT
+        assert "max_tokens" not in SEEN_COUNT
+        assert not (isinstance(SEEN_COUNT.get("system"), str)
+                    and "Ultracode is on" in SEEN_COUNT.get("system", ""))
+        _post("/uc/select", {"orchestrator": "claude-mock", "worker": "claude-mock"})
+        SEEN_OAI = None
+        SEEN_COUNT = None
+        ct_oai = json.loads(_post("/v1/messages/count_tokens", {
+            "model": "claude-mock",
+            "messages": [{"role": "user", "content": "hello world " * 40}]}))
+        assert isinstance(ct_oai.get("input_tokens"), int) and ct_oai["input_tokens"] > 0, ct_oai
+        assert SEEN_OAI is None, "openai_compat count_tokens must not hit /chat/completions"
+        assert SEEN_COUNT is None, "openai_compat count_tokens must not hit Anthropic mock"
+        _post("/uc/select", {"orchestrator": "", "worker": ""})
+        SEEN_COUNT = None
+        ct_local = json.loads(_post("/v1/messages/count_tokens", {
+            "model": "claude-opus-4-8",
+            "messages": [{"role": "user", "content": "hello world"}]}))
+        assert isinstance(ct_local.get("input_tokens"), int), ct_local
+        assert SEEN_COUNT is None, "default-upstream count_tokens must stay local (no Anthropic 401)"
+        _post("/uc/select", {"orchestrator": "claude-countfail", "worker": "claude-countfail"})
+        SEEN_COUNT = None
+        ct_fb = json.loads(_post("/v1/messages/count_tokens", {
+            "model": "claude-countfail",
+            "messages": [{"role": "user", "content": "hello world " * 20}]}))
+        assert isinstance(ct_fb.get("input_tokens"), int) and ct_fb["input_tokens"] > 0, ct_fb
+        print("[ok] count_tokens: forward / local openai_compat / local default / 500 fallback")
+
+        # Worker-shaped request (no AskUserQuestion, missing input_schema, unknown
+        # blocks) against the custom Anthropic-compat mock: sanitizer fills schema
+        # so the mock's 500-unless-input_schema path returns 200.
+        _post("/uc/select", {"orchestrator": "claude-pass", "worker": "claude-pass"})
+        SEEN_ANTH = None
+        worker_body = {
+            "model": "claude-pass", "max_tokens": 16,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "do the task", "cache_control": {"type": "ephemeral"}},
+                {"type": "document", "source": {"type": "text", "data": "x"}},
+                {"type": "tool_reference", "name": "Bash"},
+            ]}],
+            "tools": [{"name": "Bash", "description": "run a command"},
+                      {"name": "Read", "input_schema": {"type": "object", "properties": {}}}],
+            "mcp_servers": [{"name": "x"}],
+        }
+        wr = json.loads(_post("/v1/messages", worker_body))
+        assert wr.get("type") == "message", wr
+        assert SEEN_ANTH is not None
+        assert all("input_schema" in t for t in SEEN_ANTH.get("tools") or []), SEEN_ANTH.get("tools")
+        assert "mcp_servers" not in SEEN_ANTH
+        seen_types = [b.get("type") for b in SEEN_ANTH["messages"][0]["content"]
+                      if isinstance(b, dict)]
+        assert "document" not in seen_types and "tool_reference" not in seen_types, seen_types
+        assert all("cache_control" not in b for b in SEEN_ANTH["messages"][0]["content"]
+                   if isinstance(b, dict))
+        print("[ok] anthropic-compat sanitizer: worker-shaped request 200 (schema filled)")
+
         # issue #3: a rejected tool call (with or without a comment) must not leave
         # an assistant tool_calls message unanswered, and tool replies must come
         # BEFORE the user's text — otherwise strict backends (DeepSeek) 400 with
@@ -785,7 +964,6 @@ def main():
         # custom upstream unless the route opts in with auth:"passthrough". Pin the
         # selection to each passthrough slot so the turn deterministically lands on
         # it (orchestrator/worker would otherwise remap the model id).
-        global SEEN_ANTH_HEADERS
         _post("/uc/select", {"orchestrator": "claude-pass", "worker": "claude-pass"})
         SEEN_ANTH_HEADERS = None
         urllib.request.urlopen(urllib.request.Request(
