@@ -225,6 +225,11 @@ def main():
         assert h["ok"] and h["codex_helper"], h
         print("[ok] healthz + codex helper importable")
 
+        with urllib.request.urlopen(urllib.request.Request(
+                "http://127.0.0.1:%d/api/hello" % PROXY_PORT, method="HEAD")) as r:
+            assert r.getcode() == 200 and r.read() == b"", "HEAD /api/hello must be 200 empty"
+        print("[ok] HEAD /api/hello answered 200 (no 501)")
+
         models_payload = json.loads(_get("/v1/models"))["data"]
         ids = [x["id"] for x in models_payload]
         assert "claude-mock" in ids and "claude-opus-4-8" in ids, ids
