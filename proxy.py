@@ -2666,6 +2666,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._proxy("DELETE")
 
+    def do_HEAD(self):
+        # Clients (e.g. Claude Code) probe HEAD /api/hello on the base URL to
+        # check the endpoint is alive; the real API answers 200 with an empty
+        # body.
+        if not self._guard_local():
+            return
+        self._raw(200, "application/json", b"")
+
     # ---- /v1/models discovery -------------------------------------------
     def _handle_models(self) -> bool:
         # We answer /v1/models whenever there's anything to add to (or stand in
