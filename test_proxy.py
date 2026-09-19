@@ -642,6 +642,11 @@ def main():
         assert up.sanitize_anthropic_compat(clean) is False
         assert up._should_sanitize_anthropic({}) is False
         assert up._should_sanitize_anthropic({"upstream": "https://api.anthropic.com"}) is False
+        assert up._should_sanitize_anthropic({"upstream": "https://api.anthropic.com/"}) is False
+        assert up._is_real_anthropic_upstream("https://api.anthropic.com") is True
+        assert up._is_real_anthropic_upstream("https://evil.example/api.anthropic.com") is False
+        assert up._should_sanitize_anthropic(
+            {"upstream": "https://evil.example/api.anthropic.com"}) is True
         assert up._should_sanitize_anthropic({"upstream": "http://127.0.0.1:8888"}) is True
         assert up._should_sanitize_anthropic(
             {"upstream": "http://127.0.0.1:8888", "body": {"passthrough_raw": True}}) is False
@@ -690,6 +695,10 @@ def main():
         assert up._count_tokens_should_forward({}) is False
         assert up._count_tokens_should_forward({"type": "openai_compat",
                                                 "upstream": "http://x/v1"}) is False
+        assert up._count_tokens_should_forward(
+            {"upstream": "https://api.anthropic.com"}) is False
+        assert up._count_tokens_should_forward(
+            {"upstream": "https://evil.example/api.anthropic.com"}) is True
         up.UC_SLOT_MAP, up.UC_MODELS = _slots_ct, _models_ct
         print("[ok] count_tokens transform: route remap, no envelope")
 

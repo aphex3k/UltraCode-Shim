@@ -128,6 +128,7 @@ import time
 import uuid
 import urllib.request
 import urllib.error
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # --------------------------------------------------------------------------
@@ -1363,6 +1364,21 @@ _KNOWN_BLOCK_TYPES = frozenset({
 _DROP_ANTHROPIC_EXTRAS = ("mcp_servers", "container")
 
 
+def _is_real_anthropic_upstream(url):
+    """True when url's host is exactly api.anthropic.com.
+
+    Host comparison (not a substring of the whole URL) so
+    https://evil.example/api.anthropic.com is not treated as real Claude.
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return False
+    if "://" not in raw:
+        raw = "https://" + raw
+    host = (urllib.parse.urlparse(raw).hostname or "").lower()
+    return host == "api.anthropic.com"
+
+
 def _should_sanitize_anthropic(route):
     """True for Anthropic-passthrough to a non-api.anthropic.com upstream.
 
@@ -1381,7 +1397,7 @@ def _should_sanitize_anthropic(route):
         return False
     if up == (UPSTREAM or "").rstrip("/"):
         return False
-    if "api.anthropic.com" in up:
+    if _is_real_anthropic_upstream(up):
         return False
     return True
 
@@ -1403,7 +1419,7 @@ def _count_tokens_should_forward(route):
         return False
     if up == (UPSTREAM or "").rstrip("/"):
         return False
-    if "api.anthropic.com" in up:
+    if _is_real_anthropic_upstream(up):
         return False
     return True
 
