@@ -111,6 +111,31 @@ The orchestrator tier is unchanged; only parallel workers/sub-agents switch.
 Code's built-in picker; the proxy only sees the resulting model id on the next
 request. Use the plain vs `Worker →` entries above.
 
+### `/v1/messages/count_tokens` 401 / context gauge stuck / compact only after 500s
+
+Claude Code polls `POST /v1/messages/count_tokens` to drive the context meter
+and *proactive* auto-compact. If those calls 401, it cannot measure the window
+and only compacts *after* the backend starts rejecting turns.
+
+The proxy answers count_tokens itself:
+
+- **Custom Anthropic-compat upstream** (SGLang, etc.) — forwarded to
+  `{upstream}/v1/messages/count_tokens` with the rewritten model id (no UltraCode
+  envelope).
+- **`openai_compat` / `codex_oauth` / `cursor_agent`, unmatched ids, real
+  Anthropic** — a local estimate (`{"input_tokens": N}`).
+- **Upstream 4xx/5xx** — same local estimate, never a 401.
+
+If the gauge is still stuck, check the proxy log for `count_tokens local est=`
+vs `count_tokens forwarded to`. A flood of `401` on count_tokens means you're
+on a build from before this handler; update and relaunch.
+
+To capture a worker `/v1/messages` 500 (same model as a succeeding orchestrator
+turn, different payload), set `UC_DUMP_DIR=/tmp/uc-dumps` before launch. The
+first few 4xx/5xx bodies + a request fingerprint (tool names, block types,
+estimated tokens) are written there, and the proxy log always includes
+`upstream HTTP <status> … fp={…}`.
+
 ### OpenAI-compat backend errors on long sessions (context length / 400)
 
 The proxy forwards the **entire** Anthropic transcript to `openai_compat` backends

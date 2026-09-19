@@ -175,6 +175,18 @@ Anthropic-shaped gateway and add headers:
 }
 ```
 
+Local Anthropic-compat servers (SGLang, llama.cpp with an Anthropic handler, …)
+get a **sanitizer** before the request is forwarded: unknown content-block types
+are coerced to text, tools missing `input_schema` get an empty object schema,
+and `cache_control` / `mcp_servers` / `container` are stripped. That stops
+Claude Code worker payloads from HTTP 500s on Qwen/SGLang templates. Real
+`api.anthropic.com` is never sanitized. To send the raw Claude Code body to a
+custom gateway:
+
+```json
+"body": { "passthrough_raw": true }
+```
+
 ### `codex_oauth` — GPT‑5.5 via a ChatGPT/Codex login (no API key)
 
 ```json
