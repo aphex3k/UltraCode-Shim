@@ -22,6 +22,15 @@ That's it. Anything that speaks the Anthropic Messages API and honors those
 fields gets the UltraCode treatment. Because it's just request shape, we can put
 the *same* envelope on a request and then forward it to **any** backend.
 
+One exception: **compaction turns**. Claude Code's `/compact` and auto-compact
+send the summary prompt as the last user message of an ordinary
+`/v1/messages` call; the proxy detects that prompt and skips the forced
+`effort`/`thinking` on that turn (dropping any client-supplied `thinking`),
+because thinking tokens count against the summary's `max_tokens` and a summary
+stopped at the cap is a hard client-side error. The `max_tokens` floor and the
+per-route `context_length` clamp still apply, so the summary gets the full
+remaining window.
+
 ## 2. The proxy
 
 `proxy.py` is a standard-library HTTP server you point Claude Code at via
@@ -30,7 +39,12 @@ the *same* envelope on a request and then forward it to **any** backend.
 1. **Forces the envelope** on `POST /v1/messages` — sets `effort=xhigh`, adaptive
    `thinking`, raises `max_tokens` to the floor (default 64000), and injects the
    reminder if it isn't already present. (Toggle with `UC_FORCE_EFFORT`,
-   `UC_FORCE_THINKING`, `UC_MAX_TOKENS`, `UC_INJECT_REMINDER`.)
+   `UC_FORCE_THINKING`, `UC_MAX_TOKENS`, `UC_INJECT_REMINDER`;
+   `UC_COMPACT_MARKERS` overrides the compaction-turn detection markers.)
+   Compaction turns skip the forced `effort`/`thinking` (see §1). The launchers
+   also export `CLAUDE_CODE_MAX_OUTPUT_TOKENS` equal to the floor
+   (`UC_MAX_TOKENS` > config `proxy.max_tokens_floor` > 64000), so the client's
+   cap and the shim's floor stay aligned by construction.
 2. **Serves `GET /v1/models`**, merging Anthropic's real model list with your
    own entries from `config.json` so they show up in the `/model` picker.
 3. **Routes** each model id Claude Code sends to a real backend, per the

@@ -71,6 +71,14 @@ PORT="${UC_LISTEN_PORT:-$("$PY" -c 'import json,sys;c=json.load(open(sys.argv[1]
 UPSTREAM="${UC_UPSTREAM:-$("$PY" -c 'import json,sys;c=json.load(open(sys.argv[1]));print((c.get("proxy") or {}).get("anthropic_upstream") or "https://api.anthropic.com")' "$CONFIG" 2>/dev/null || echo https://api.anthropic.com)}"
 BASE_URL="http://127.0.0.1:${PORT}"
 
+# Output-token cap: keep the client's CLAUDE_CODE_MAX_OUTPUT_TOKENS aligned with
+# the proxy's max_tokens floor by construction. Precedence mirrors proxy.py
+# (UC_MAX_TOKENS > config proxy.max_tokens_floor > 64000) and reads the SAME
+# config file the proxy gets via UC_CONFIG, so the two cannot drift; a
+# user-set CLAUDE_CODE_MAX_OUTPUT_TOKENS still wins.
+MAX_TOKENS_FLOOR="${UC_MAX_TOKENS:-$("$PY" -c 'import json,sys;c=json.load(open(sys.argv[1]));print(int((c.get("proxy") or {}).get("max_tokens_floor") or 64000))' "$CONFIG" 2>/dev/null || echo 64000)}"
+CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-$MAX_TOKENS_FLOOR}"
+
 # 1M context window enablement ------------------------------------------------
 # Claude Code only switches its context meter AND auto-compaction to the 1M
 # window (and sends the context-1m beta) when the model id carries the [1m]
@@ -107,6 +115,7 @@ cat > "$SETTINGS_TMP" <<JSON
   "model": "$DEFAULT_MODEL",
   "env": {
     "ANTHROPIC_BASE_URL": "$BASE_URL",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "$CLAUDE_CODE_MAX_OUTPUT_TOKENS",
     "CLAUDE_CODE_WORKFLOWS": "1",
     "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"
   }
@@ -274,6 +283,7 @@ json.dump({'baseUrl':base,'fetchedAt':int(time.time()*1000),'models':models}, op
 PY
 
 export ANTHROPIC_BASE_URL="$BASE_URL"
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS="$CLAUDE_CODE_MAX_OUTPUT_TOKENS"
 export CLAUDE_CODE_WORKFLOWS=1
 export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
 

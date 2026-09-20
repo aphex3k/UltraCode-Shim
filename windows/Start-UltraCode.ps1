@@ -69,6 +69,18 @@ if (-not $Upstream) {
     $Upstream = if ($Cfg.proxy.anthropic_upstream) { [string]$Cfg.proxy.anthropic_upstream } else { "https://api.anthropic.com" }
 }
 
+# ----- resolve the output-token cap ------------------------------------------
+# Keep the client's CLAUDE_CODE_MAX_OUTPUT_TOKENS aligned with the proxy's
+# max_tokens floor by construction (same precedence as proxy.py and
+# bin/ultracode: UC_MAX_TOKENS beats config proxy.max_tokens_floor beats
+# 64000). A pre-set CLAUDE_CODE_MAX_OUTPUT_TOKENS still wins.
+$MaxTokensFloor = 64000
+try { if ($Cfg.proxy.max_tokens_floor) { $MaxTokensFloor = [int]$Cfg.proxy.max_tokens_floor } } catch {}
+if ($env:UC_MAX_TOKENS) {
+    try { $MaxTokensFloor = [int]$env:UC_MAX_TOKENS } catch {}
+}
+$MaxOutputTokens = if ($env:CLAUDE_CODE_MAX_OUTPUT_TOKENS) { [string]$env:CLAUDE_CODE_MAX_OUTPUT_TOKENS } else { [string]$MaxTokensFloor }
+
 # ----- load optional ultracode.env into this process (for ${VAR} auth) ------
 if (Test-Path $EnvFile) {
     Get-Content $EnvFile | ForEach-Object {
@@ -120,6 +132,7 @@ $DefaultModel = Add-Uc1m "claude-opus-4-8"
     model     = $DefaultModel
     env       = @{
         ANTHROPIC_BASE_URL                         = $BaseUrl
+        CLAUDE_CODE_MAX_OUTPUT_TOKENS              = $MaxOutputTokens
         CLAUDE_CODE_WORKFLOWS                       = "1"
         CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY  = "1"
     }
@@ -322,6 +335,7 @@ if ($ProxyOnly) {
 
 # ----- launch Claude Code through the proxy ---------------------------------
 $env:ANTHROPIC_BASE_URL = $BaseUrl
+$env:CLAUDE_CODE_MAX_OUTPUT_TOKENS = $MaxOutputTokens
 $env:CLAUDE_CODE_WORKFLOWS = "1"
 $env:CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = "1"
 

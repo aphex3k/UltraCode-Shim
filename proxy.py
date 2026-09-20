@@ -148,6 +148,21 @@ CONTEXT_MIN_MAX_TOKENS = int(os.environ.get("UC_MIN_MAX_TOKENS", "1024"))
 FORCE_EFFORT = os.environ.get("UC_FORCE_EFFORT", "xhigh")
 FORCE_THINKING = os.environ.get("UC_FORCE_THINKING", "1") == "1"
 INJECT_REMINDER = os.environ.get("UC_INJECT_REMINDER", "1") == "1"
+# Compaction turns (Claude Code /compact + auto-compact) skip the forced
+# effort/thinking envelope: the summary IS the output, thinking tokens count
+# against output_tokens, and hitting max_tokens during compaction is a hard
+# client-side error on fixed-window backends. Substring markers (lowercase)
+# that identify the compact prompt in the last user message; override with
+# UC_COMPACT_MARKERS (comma- or newline-separated).
+_DEFAULT_COMPACT_MARKERS = (
+    "summary of the conversation so far",
+    "your task is to create a comprehensive summary",
+)
+COMPACTION_MARKERS = tuple(
+    m.strip().lower()
+    for m in os.environ.get("UC_COMPACT_MARKERS", "").replace(",", "\n").split("\n")
+    if m.strip()
+) or _DEFAULT_COMPACT_MARKERS
 INCLUDE_STOCK_MODELS = os.environ.get("UC_INCLUDE_STOCK_MODELS", "1") != "0"
 LEARN_STOCK_MODELS = os.environ.get("UC_STOCK_LEARN", "1") != "0"
 VERBOSE = os.environ.get("UC_VERBOSE", "0") == "1"
@@ -1312,14 +1327,52 @@ def resolve_messages_route(body):
     return changed, route
 
 
+def _last_user_msg_text(body):
+    """Text of the LITERAL last user message (bare string, or its text blocks
+    joined). Unlike _latest_user_turn (router cache key), a trailing
+    tool_result-only turn is NOT skipped: it yields "" so a marker hidden in a
+    tool result can never look like a user prompt. "" when no user message."""
+    for msg in reversed(body.get("messages") or []):
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return " ".join(
+                b.get("text") for b in content
+                if isinstance(b, dict) and isinstance(b.get("text"), str)
+            )
+        return ""
+    return ""
+
+
+def _is_compaction_request(body):
+    """True when the literal last user message matches a Claude Code compact
+    prompt (case-insensitive substring)."""
+    text = _last_user_msg_text(body).lower()
+    return bool(text) and any(m in text for m in COMPACTION_MARKERS)
+
+
 def apply_ultracode_envelope(body, route):
     """Mutate body with effort / thinking / max_tokens floor / reminder / clamp.
 
     Returns True if anything changed. Skipped for count_tokens so the gauge
     measures Claude Code's request, not the envelope we'd add on the real turn.
+
+    Compaction turns skip the forced effort/thinking envelope: the compact
+    call is the summary request itself, and hitting max_tokens mid-compaction
+    is a hard client-side error on fixed-window backends.
     """
     changed = False
-    if FORCE_EFFORT:
+    compacting = _is_compaction_request(body)
+    if compacting:
+        # Compact prompts inherit the session's extended-thinking config since
+        # Claude Code v2.1.198; thinking tokens count against output_tokens,
+        # so drop whatever the client sent.
+        body.pop("thinking", None)
+
+    if FORCE_EFFORT and not compacting:
         oc = body.get("output_config")
         if not isinstance(oc, dict):
             oc = {}
@@ -1331,15 +1384,17 @@ def apply_ultracode_envelope(body, route):
             body["output_config"] = oc
             changed = True
 
-    if FORCE_THINKING:
+    if FORCE_THINKING and not compacting:
         th = body.get("thinking")
         if not isinstance(th, dict) or th.get("type") not in ("adaptive", "enabled"):
             body["thinking"] = {"type": "adaptive"}
             changed = True
 
+    floored = False
     mt = body.get("max_tokens")
     if not isinstance(mt, int) or mt < MAX_TOKENS_FLOOR:
         body["max_tokens"] = MAX_TOKENS_FLOOR
+        floored = True
         changed = True
 
     if INJECT_REMINDER and not _system_has_reminder(body.get("system")):
@@ -1348,9 +1403,19 @@ def apply_ultracode_envelope(body, route):
 
     _mt0 = body.get("max_tokens")
     _mt1 = apply_context_clamp(_mt0, route, body)
-    if _mt1 != _mt0:
+    clamped = _mt1 != _mt0
+    if clamped:
         body["max_tokens"] = _mt1
         changed = True
+
+    if compacting:
+        log(
+            "compaction turn: est_input=%d max_tokens=%d floor=%s clamp=%s context_length=%s"
+            % (estimate_input_tokens(body), body["max_tokens"],
+               "applied" if floored else "unchanged",
+               "applied" if clamped else "unchanged",
+               route.get("context_length", "-"))
+        )
     return changed
 
 
