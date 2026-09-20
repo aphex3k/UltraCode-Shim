@@ -617,6 +617,86 @@ def main():
         up.UC_SLOT_MAP, up.UC_MODELS = _slots_ctx, _models_ctx
         print("[ok] context-window clamp: transform_messages_body slot->route carry + clamp")
 
+        # ---- compaction-turn handling --------------------------------------
+        # Claude Code's /compact + auto-compact send a regular /v1/messages with a
+        # summary prompt; hitting max_tokens there is a hard client-side error, so
+        # the envelope must skip forced effort/thinking and drop client thinking.
+        # NOTE: distinct from the router's _last_user_text (which SKIPS trailing
+        # tool-only turns to keep the cache key on the task); compaction
+        # detection must use the literal last user message.
+        assert up._last_user_msg_text({}) == ""
+        assert up._last_user_msg_text({"messages": []}) == ""
+        assert up._last_user_msg_text({"messages": [
+            {"role": "assistant", "content": "summary of the conversation so far"}]}) == ""
+        assert up._last_user_msg_text({"messages": [
+            {"role": "user", "content": "hello"}]}) == "hello"
+        assert up._last_user_msg_text({"messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "part one"},
+                {"type": "text", "text": "part two"}]}]}) == "part one part two"
+        # a tool_result-only last user turn has no user text: the marker inside the
+        # tool_result must NOT count as a user prompt.
+        assert up._last_user_msg_text({"messages": [
+            {"role": "user", "content": "summary of the conversation so far"},
+            {"role": "assistant", "content": "done"},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "c1",
+                                          "content": "summary of the conversation so far"}]}]}) == ""
+        compact_prompt = ("Your task is to create a comprehensive summary "
+                          "of the conversation so far.")
+        assert up._is_compaction_request({"messages": [
+            {"role": "user", "content": compact_prompt}]}) is True
+        assert up._is_compaction_request({"messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "SUMMARY OF THE CONVERSATION SO FAR, please"}]}]}
+            ) is True
+        assert up._is_compaction_request({"messages": [
+            {"role": "user", "content": "Please give me a summary of the changes."}]}) is False
+        assert up._is_compaction_request({"messages": [
+            {"role": "user", "content": compact_prompt},
+            {"role": "assistant", "content": "done"},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "c1",
+                                          "content": "summary of the conversation so far"}]}]}) is False
+        assert up._is_compaction_request({"messages": []}) is False
+        # envelope unit: compaction keeps floor + clamp but skips effort/thinking
+        # and drops any client-supplied thinking.
+        cb = {"model": "claude-x", "max_tokens": 100,
+              "thinking": {"type": "enabled", "budget_tokens": 4096},
+              "messages": [{"role": "user", "content": compact_prompt}]}
+        up.apply_ultracode_envelope(cb, {"context_length": 60000})
+        assert "thinking" not in cb, cb
+        assert "output_config" not in cb, cb
+        assert up.CONTEXT_MIN_MAX_TOKENS <= cb["max_tokens"] < 64000, cb["max_tokens"]
+        cb2 = {"max_tokens": 100, "messages": [{"role": "user", "content": compact_prompt}]}
+        up.apply_ultracode_envelope(cb2, {})
+        assert "thinking" not in cb2 and "output_config" not in cb2, cb2
+        assert cb2["max_tokens"] == 64000          # floor still applies on compaction
+        nb = {"max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]}
+        up.apply_ultracode_envelope(nb, {"context_length": 60000})
+        assert nb["thinking"]["type"] == "adaptive"
+        assert nb["output_config"]["effort"] == "xhigh"
+        assert nb["max_tokens"] < 64000
+        print("[ok] compaction detection + envelope (skip effort/thinking, keep floor/clamp)")
+        # e2e through the LIVE proxy: a compaction turn on a fixed-window route gets
+        # no forced thinking/effort and a clamped max_tokens; a normal turn right
+        # after gets the full envelope again (stateless, per-request).
+        _post("/v1/messages", {"model": "claude-ctxpass", "max_tokens": 100,
+                               "messages": [{"role": "user", "content": compact_prompt}]})
+        assert "thinking" not in SEEN_ANTH, SEEN_ANTH
+        assert "output_config" not in SEEN_ANTH, SEEN_ANTH
+        assert SEEN_ANTH["max_tokens"] < 64000, SEEN_ANTH["max_tokens"]
+        assert SEEN_ANTH["max_tokens"] >= up.CONTEXT_MIN_MAX_TOKENS
+        _post("/v1/messages", {"model": "claude-ctxpass", "max_tokens": 100,
+                               "messages": [{"role": "user", "content": "hi"}]})
+        assert SEEN_ANTH["thinking"]["type"] == "adaptive"
+        assert SEEN_ANTH["output_config"]["effort"] == "xhigh"
+        # count_tokens keeps skipping the envelope even for a compaction-shaped body.
+        SEEN_COUNT = None
+        _post("/v1/messages/count_tokens", {"model": "claude-opus-4-8", "max_tokens": 100,
+                                            "messages": [{"role": "user", "content": compact_prompt}]})
+        assert SEEN_COUNT is not None, "custom-route count_tokens must be forwarded"
+        assert "thinking" not in SEEN_COUNT and "output_config" not in SEEN_COUNT, SEEN_COUNT
+        print("[ok] compaction turn e2e: no forced thinking/effort + clamped budget; count_tokens unaffected")
+
         # ---- count_tokens + Anthropic-compat sanitizer --------------------
         # Unit: sanitizer coerces unknown blocks, fills input_schema, strips
         # cache_control / mcp_servers; api.anthropic.com is not sanitized.

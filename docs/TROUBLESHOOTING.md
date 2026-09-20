@@ -152,6 +152,54 @@ with no automatic trimming. On long multi-tool workflows a backend may return
 Strict backends also require `content: null` (not `""`) on tool-only assistant
 turns; the proxy handles that automatically.
 
+### Compaction fails with "Claude's response exceeded the N output token maximum"
+
+Compaction (`/compact`, auto-compact) is a regular `/v1/messages` call whose
+whole output is the summary; Claude Code treats a response stopped at its
+requested `max_tokens` as this hard error. Four caps interact, and on
+fixed-window backends (SGLang and similar) they must agree:
+
+- **Client cap** — `CLAUDE_CODE_MAX_OUTPUT_TOKENS`: what Claude Code requests
+  and enforces. For custom/gateway model ids the default is 32000 unless you
+  set it.
+- **Shim floor** — the proxy raises every request to at least
+  `proxy.max_tokens_floor` (default 64000; `UC_MAX_TOKENS` overrides).
+- **Route window** — a route `context_length` makes the proxy clamp
+  `max_tokens` to `context_length - estimated_input - 4096`. Without it, the
+  backend's real window is invisible to the shim.
+- **Forced thinking** — the compact call inherits the session's extended
+  thinking config, and thinking tokens count against the summary's output
+  budget.
+
+**Fix, in order (256K SGLang example):**
+
+1. **Declare the window on the route:** add `"context_length": 262144` (your
+   backend's real limit) to the route in `config.json` so the clamp keeps
+   `input + output` inside the window.
+2. **Raise the floor to the backend's real max output:**
+   `"proxy": {"max_tokens_floor": 131072}` (or `UC_MAX_TOKENS=131072`). With a
+   256K window, 128K of output room puts auto-compact at ~125K of input, where
+   `262144 - 125000 - 4096 >= 131072` still fits, so the summary can't be
+   starved.
+3. **Align the client:** the launchers (`bin/ultracode`,
+   `windows/Start-UltraCode.ps1`) export `CLAUDE_CODE_MAX_OUTPUT_TOKENS` equal
+   to that floor by construction, so launching through them keeps the two in
+   sync automatically. Starting `claude` manually? Set
+   `CLAUDE_CODE_MAX_OUTPUT_TOKENS` to the same value yourself.
+4. **Match the client's assumed window** for custom/gateway ids:
+   `CLAUDE_CODE_MAX_CONTEXT_TOKENS=262144`, so the context meter and
+   auto-compact timing use the real window instead of the ~200K default.
+   `CLAUDE_CODE_AUTO_COMPACT_WINDOW` tunes when compaction triggers.
+
+The shim also detects compaction turns: when the last user message looks like
+Claude Code's compact prompt ("...summary of the conversation so far..."), the
+envelope skips forced `thinking`/`effort` and drops any client-supplied
+`thinking`, so the summary gets the full output budget. Each such turn logs
+`compaction turn: est_input=... max_tokens=...` to the proxy log; `/healthz`
+reports the effective `max_tokens_floor`. If a client build rewords the
+compact prompt, extend the markers with `UC_COMPACT_MARKERS` (comma-separated
+case-insensitive substrings).
+
 ### The pre-launch selector doesn't open / says it cannot reach `/uc/select`
 
 - **Proxy not healthy yet or wrong port.** The launcher starts the proxy before
